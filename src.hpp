@@ -11,6 +11,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
     gpu_sim.MoveMatrixToSharedMem(current_query);
 
+    // Build K_stack (i+1 x d) in SRAM
     Matrix *k_stack = matrix_memory_allocator.Allocate("k_stack_init");
     gpu_sim.MoveMatrixToSharedMem(keys[0]);
     gpu_sim.Copy(keys[0], k_stack, kInSharedMemory);
@@ -24,11 +25,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
     gpu_sim.Transpose(k_stack, kInSharedMemory);
 
+    // scores = Q * K^T in SRAM
     Matrix *scores = matrix_memory_allocator.Allocate("scores");
     gpu_sim.MatMul(current_query, k_stack, scores);
 
-    Matrix *softmax_mat = nullptr;
+    // Build answer row-by-row to reduce SRAM and avoid large MatMul
+    Matrix *answer_stack = nullptr;
     for (size_t row = 0; row <= i; ++row) {
+      // softmax on this row
       Matrix *row_mat = matrix_memory_allocator.Allocate("row");
       gpu_sim.GetRow(scores, row, row_mat, kInSharedMemory);
       Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
@@ -41,41 +45,52 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
 
-      if (softmax_mat == nullptr) {
-        softmax_mat = matrix_memory_allocator.Allocate("softmax_init");
-        gpu_sim.Copy(row_soft, softmax_mat, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(row_soft);
-      } else {
-        Matrix *softmax_next = matrix_memory_allocator.Allocate("softmax_next");
-        gpu_sim.Concat(softmax_mat, row_soft, softmax_next, 0, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(softmax_mat);
-        gpu_sim.ReleaseMatrix(row_soft);
-        softmax_mat = softmax_next;
+      // weighted sum over V[j]
+      Matrix *acc = nullptr;
+      for (size_t j = 0; j <= i; ++j) {
+        gpu_sim.MoveMatrixToSharedMem(values[j]);
+        Matrix *weight = matrix_memory_allocator.Allocate("weight");
+        gpu_sim.GetColumn(row_soft, j, weight, kInSharedMemory); // 1x1
+        Matrix *weighted = matrix_memory_allocator.Allocate("weighted_v");
+        gpu_sim.MatMulNum(values[j], weight, weighted);
+        gpu_sim.ReleaseMatrix(weight);
+        if (acc == nullptr) {
+          acc = matrix_memory_allocator.Allocate("acc_init");
+          gpu_sim.Copy(weighted, acc, kInSharedMemory);
+          gpu_sim.ReleaseMatrix(weighted);
+        } else {
+          Matrix *new_acc = matrix_memory_allocator.Allocate("acc_next");
+          gpu_sim.MatAdd(acc, weighted, new_acc);
+          gpu_sim.ReleaseMatrix(acc);
+          gpu_sim.ReleaseMatrix(weighted);
+          acc = new_acc;
+        }
       }
+
+      // append acc as one row to answer_stack
+      if (answer_stack == nullptr) {
+        answer_stack = matrix_memory_allocator.Allocate("answer_init");
+        gpu_sim.Copy(acc, answer_stack, kInSharedMemory);
+        gpu_sim.ReleaseMatrix(acc);
+      } else {
+        Matrix *ans_next = matrix_memory_allocator.Allocate("answer_next");
+        gpu_sim.Concat(answer_stack, acc, ans_next, 0, kInSharedMemory);
+        gpu_sim.ReleaseMatrix(answer_stack);
+        gpu_sim.ReleaseMatrix(acc);
+        answer_stack = ans_next;
+      }
+
+      gpu_sim.ReleaseMatrix(row_soft);
     }
 
-    Matrix *v_stack = matrix_memory_allocator.Allocate("v_stack_init");
-    gpu_sim.MoveMatrixToSharedMem(values[0]);
-    gpu_sim.Copy(values[0], v_stack, kInSharedMemory);
-    for (size_t j = 1; j <= i; ++j) {
-      gpu_sim.MoveMatrixToSharedMem(values[j]);
-      Matrix *v_next = matrix_memory_allocator.Allocate("v_stack_next");
-      gpu_sim.Concat(v_stack, values[j], v_next, 0, kInSharedMemory);
-      gpu_sim.ReleaseMatrix(v_stack);
-      v_stack = v_next;
-    }
-
-    Matrix *answer = matrix_memory_allocator.Allocate("answer");
-    gpu_sim.MatMul(softmax_mat, v_stack, answer);
-
+    // cleanup intermediates
     gpu_sim.ReleaseMatrix(scores);
     gpu_sim.ReleaseMatrix(k_stack);
-    gpu_sim.ReleaseMatrix(softmax_mat);
-    gpu_sim.ReleaseMatrix(v_stack);
 
-    gpu_sim.MoveMatrixToGpuHbm(answer);
+    // Move answer to HBM and commit
+    gpu_sim.MoveMatrixToGpuHbm(answer_stack);
     gpu_sim.Run(false, &matrix_memory_allocator);
-    rater.CommitAnswer(*answer);
+    rater.CommitAnswer(*answer_stack);
   }
 }
 
